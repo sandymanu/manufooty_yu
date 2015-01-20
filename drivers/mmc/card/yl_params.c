@@ -46,6 +46,7 @@ const char *yl_params_map[] = {
 	[YL_FCT_DIAG]		= "FCT_DIAG",
 	[YL_RCP]		= "RCP",
 	[YL_RETURNZERO]		= "RETURNZERO",
+	[YL_VIRTOS_PASSWD]  = "VIRTOS_PASSWD",
 };
 
 enum preload_state {
