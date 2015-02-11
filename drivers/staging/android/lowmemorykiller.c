@@ -32,6 +32,7 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#define REALLY_WANT_TRACEPOINTS
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
@@ -44,6 +45,9 @@
 #include <linux/swap.h>
 #include <linux/fs.h>
 
+#include <linux/powersuspend.h>
+#include <trace/events/memkill.h>
+
 #ifdef CONFIG_HIGHMEM
 #define _ZONE ZONE_HIGHMEM
 #else
@@ -51,24 +55,29 @@
 #endif
 
 static uint32_t lowmem_debug_level = 1;
+static uint32_t lowmem_auto_oom = 0;
 static short lowmem_adj[6] = {
 	0,
 	1,
 	6,
 	12,
 static uint32_t lowmem_auto_oom = 1;
+	13,
+	15,
+};
+static int lowmem_adj_size = 6;
 static int lowmem_minfree[6] = {
-	3 * 512,	/* 6MB */
-	2 * 1024,	/* 8MB */
-	4 * 1024,	/* 16MB */
+	5 * 512,	/* 6MB */
+	4 * 1024,	/* 8MB */
+	8 * 1024,	/* 16MB */
 	16 * 1024,	/* 64MB */
 	28 * 1024,	/* 112MB */
 	32 * 1024,	/* 131MB */
 };
 static int lowmem_minfree_screen_off[6] = {
-	3 * 512,	/* 6MB */
-	2 * 1024,	/* 8MB */
-	4 * 1024,	/* 16MB */
+	5 * 512,	/* 6MB */
+	4 * 1024,	/* 8MB */
+	8 * 1024,	/* 16MB */
 	16 * 1024,	/* 64MB */
 	28 * 1024,	/* 112MB */
 	32 * 1024,	/* 131MB */
@@ -78,6 +87,9 @@ static int lowmem_minfree[6] = {
 	3 * 512,	/* 6MB */
 	2 * 1024,	/* 8MB */
 	4 * 1024,	/* 16MB */
+	5 * 512,	/* 6MB */
+	4 * 1024,	/* 8MB */
+	8 * 1024,	/* 16MB */
 	16 * 1024,	/* 64MB */
 	28 * 1024,	/* 112MB */
 	32 * 1024,	/* 131MB */
@@ -95,7 +107,8 @@ static unsigned long lowmem_deathpending_timeout;
 
 static bool avoid_to_kill(uid_t uid)
 {
-	/* uid info
+	/*
+	 * uid info
 	 * uid == 0 > root
 	 * uid == 1001 > radio
 	 * uid == 1002 > bluetooth
@@ -113,7 +126,9 @@ static bool protected_apps(char *comm)
 {
 	if (strcmp(comm, "d.process.acore") == 0 ||
 			strcmp(comm, "ndroid.systemui") == 0 ||
-			strcmp(comm, "ndroid.contacts") == 0) {
+			strcmp(comm, "ndroid.contacts") == 0 ||
+			strcmp(comm, "ndroid.launcher") == 0 ||
+			strcmp(comm, "system:ui") == 0) {
 		return 1;
 	}
 	return 0;
@@ -121,16 +136,16 @@ static bool protected_apps(char *comm)
 
 static int test_task_flag(struct task_struct *p, int flag)
 {
-	struct task_struct *t = p;
+	struct task_struct *t;
 
-	do {
+	for_each_thread(p,t) {
 		task_lock(t);
 		if (test_tsk_thread_flag(t, flag)) {
 			task_unlock(t);
 			return 1;
 		}
 		task_unlock(t);
-	} while_each_thread(p, t);
+	}
 
 	return 0;
 }
@@ -166,6 +181,7 @@ struct zone_avail {
 	unsigned long free;
 	unsigned long file;
 };
+
 
 void tune_lmk_zone_param(struct zonelist *zonelist, int classzone_idx,
 					int *other_free, int *other_file,
@@ -338,6 +354,8 @@ static int lowmem_shrink(struct shrinker *s, struct shrink_control *sc)
 {
 	struct task_struct *tsk;
 	struct task_struct *selected = NULL;
+	const struct cred *pcred;
+	unsigned int uid = 0;
 	int rem = 0;
 	int tasksize;
 	int i;
@@ -474,6 +492,22 @@ static int lowmem_shrink(struct shrinker *s, struct shrink_control *sc)
 		} else {
 			lowmem_print(2, "selected skipped %d (%s), adj %d, size %d, to kill\n",
 			     	p->pid, p->comm, oom_score_adj, tasksize);
+		if (avoid_to_kill(uid) || protected_apps(p->comm)) {
+			if (tasksize * (long)(PAGE_SIZE / 1024) >= 100000) {
+				selected = p;
+				selected_tasksize = tasksize;
+				selected_oom_score_adj = oom_score_adj;
+				lowmem_print(2, "select '%s' (%d), adj %hd, size %ldkB, to kill\n",
+					p->comm, p->pid, oom_score_adj, tasksize * (long)(PAGE_SIZE / 1024));
+			} else
+				lowmem_print(2, "selected skipped %s' (%d), adj %hd, size %ldkB, not kill\n",
+					p->comm, p->pid, oom_score_adj, tasksize * (long)(PAGE_SIZE / 1024));
+		} else {
+			selected = p;
+			selected_tasksize = tasksize;
+			selected_oom_score_adj = oom_score_adj;
+			lowmem_print(2, "select %s' (%d), adj %hd, size %ldkB, to kill\n",
+				p->comm, p->pid, oom_score_adj, tasksize * (long)(PAGE_SIZE / 1024));
 		}
 	}
 	if (selected) {
@@ -524,6 +558,44 @@ static struct shrinker lowmem_shrinker = {
 	.shrink = lowmem_shrink,
 	.seeks = DEFAULT_SEEKS * 16
 };
+
+static void low_mem_power_suspend(struct power_suspend *handler)
+{
+	if (lowmem_auto_oom && lowmem_minfree != lowmem_minfree_screen_off) {
+		memcpy(lowmem_minfree_screen_on, lowmem_minfree, sizeof(lowmem_minfree));
+		memcpy(lowmem_minfree, lowmem_minfree_screen_off, sizeof(lowmem_minfree_screen_off));
+	}
+}
+
+static void low_mem_late_resume(struct power_suspend *handler)
+{
+	if (lowmem_auto_oom && lowmem_minfree != lowmem_minfree_screen_off)
+		memcpy(lowmem_minfree, lowmem_minfree_screen_on, sizeof(lowmem_minfree_screen_on));
+}
+
+static struct power_suspend low_mem_suspend = {
+	.suspend = low_mem_power_suspend,
+	.resume = low_mem_late_resume,
+};
+
+#ifdef CONFIG_ANDROID_BG_SCAN_MEM
+static int lmk_task_migration_notify(struct notifier_block *nb,
+					unsigned long data, void *arg)
+{
+	struct shrink_control sc = {
+		.gfp_mask = GFP_KERNEL,
+		.nr_to_scan = 1,
+	};
+
+	lowmem_shrink(&lowmem_shrinker, &sc);
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block tsk_migration_nb = {
+	.notifier_call = lmk_task_migration_notify,
+};
+#endif
 
 static int __init lowmem_init(void)
 {
@@ -709,10 +781,10 @@ module_param_array_named(minfree, lowmem_minfree, uint, &lowmem_minfree_size,
 module_param_array_named(minfree_screen_off, lowmem_minfree_screen_off, uint, &lowmem_minfree_size,
 			 S_IRUGO | S_IWUSR);
 module_param_named(debug_level, lowmem_debug_level, uint, S_IRUGO | S_IWUSR);
+module_param_named(auto_oom, lowmem_auto_oom, uint, S_IRUGO | S_IWUSR);
 module_param_named(lmk_fast_run, lmk_fast_run, int, S_IRUGO | S_IWUSR);
 
 module_init(lowmem_init);
 module_exit(lowmem_exit);
 
 MODULE_LICENSE("GPL");
-
